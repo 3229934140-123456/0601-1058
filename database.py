@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import csv
 from datetime import datetime, timedelta, date
 
 DB_PATH = os.path.join(os.path.expanduser('~'), '.filmtrack.db')
@@ -77,9 +78,30 @@ def init_db():
     _migrate(conn)
     conn.close()
 
+def find_duplicate_work(title, original_title=None, year=None):
+    conn = get_conn()
+    c = conn.cursor()
+    query = 'SELECT * FROM works WHERE LOWER(title) = LOWER(?)'
+    params = [title]
+    if original_title:
+        query += ' OR LOWER(original_title) = LOWER(?)'
+        params.append(original_title)
+    if year:
+        query += ' AND year = ?'
+        params.append(year)
+    c.execute(query, params)
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 def add_work(title, original_title=None, work_type='series', year=None,
              platform=None, total_episodes=0, genre=None, next_air_date=None,
-             air_weekday=None, episodes_per_air=1, remind_days_before=1):
+             air_weekday=None, episodes_per_air=1, remind_days_before=1,
+             skip_dup_check=False):
+    if not skip_dup_check:
+        dups = find_duplicate_work(title, original_title, year)
+        if dups:
+            return None, f'已存在相同作品：[ID={dups[0]["id"]}] {dups[0]["title"]}'
     conn = get_conn()
     c = conn.cursor()
     now = datetime.now().isoformat()
@@ -92,12 +114,20 @@ def add_work(title, original_title=None, work_type='series', year=None,
     work_id = c.lastrowid
     conn.commit()
     conn.close()
-    return work_id
+    return work_id, None
 
 def get_work(work_id):
     conn = get_conn()
     c = conn.cursor()
     c.execute('SELECT * FROM works WHERE id = ?', (work_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def get_watch_log(log_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM watch_logs WHERE id = ?', (log_id,))
     row = c.fetchone()
     conn.close()
     return row
@@ -140,6 +170,38 @@ def validate_episode(work, episode):
         if episode > work['total_episodes']:
             return None, f'集数不能超过总集数 {work["total_episodes"]}（当前输入 {episode}）'
     return episode, None
+
+def _recalc_work_progress(conn, work_id):
+    c = conn.cursor()
+    c.execute('SELECT * FROM works WHERE id = ?', (work_id,))
+    work = c.fetchone()
+    if not work:
+        return
+    is_movie = work['type'] == 'movie'
+    total = work['total_episodes'] or 0
+    if is_movie:
+        c.execute('SELECT COUNT(*) as cnt, MAX(watched_at) as last_at FROM watch_logs WHERE work_id = ?', (work_id,))
+        r = c.fetchone()
+        has_logs = r['cnt'] > 0
+        new_ep = (total if total > 0 else 1) if has_logs else 0
+        new_status = 'completed' if has_logs else work['status']
+        last_at = r['last_at']
+    else:
+        c.execute('''SELECT MAX(episode) as max_ep, MAX(watched_at) as last_at
+            FROM watch_logs WHERE work_id = ? AND episode IS NOT NULL''', (work_id,))
+        r = c.fetchone()
+        max_ep = r['max_ep'] or 0
+        new_ep = max_ep
+        last_at = r['last_at']
+        if max_ep <= 0:
+            new_status = work['status'] if work['status'] != 'completed' else 'to-watch'
+        elif total > 0 and max_ep >= total:
+            new_status = 'completed'
+        else:
+            new_status = 'watching' if work['status'] not in ('dropped', 'on-hold') else work['status']
+    c.execute('UPDATE works SET current_episode = ?, last_watched_at = ?, status = ? WHERE id = ?',
+        (new_ep, last_at, new_status, work_id))
+    conn.commit()
 
 def update_status(work_id, status, current_episode=None):
     conn = get_conn()
@@ -186,21 +248,18 @@ def watch_episodes(work_id, start_episode=None, count=1, watched_at=None, movie=
         if start_episode <= 0:
             conn.close()
             return False, '起始集数必须大于 0', []
-        if total > 0 and start_episode > total:
-            conn.close()
-            return False, f'起始集数 {start_episode} 超过总集数 {total}', []
         if count <= 0:
             conn.close()
             return False, '观看集数必须大于 0', []
-        logged_eps = list(range(start_episode, start_episode + count))
+        end_episode = start_episode + count - 1
         if total > 0:
-            max_allowed = total
-            valid_eps = [e for e in logged_eps if e <= max_allowed]
-            if not valid_eps:
+            if start_episode > total:
                 conn.close()
-                return False, f'所有集数均超过总集数 {total}', []
-            if len(valid_eps) < len(logged_eps):
-                logged_eps = valid_eps
+                return False, f'起始集数 {start_episode} 超过总集数 {total}', []
+            if end_episode > total:
+                conn.close()
+                return False, f'想记录到第 {end_episode} 集，但总集数只有 {total}', []
+        logged_eps = list(range(start_episode, end_episode + 1))
         final_ep = logged_eps[-1]
 
     if watched_at:
@@ -230,6 +289,58 @@ def watch_episodes(work_id, start_episode=None, count=1, watched_at=None, movie=
     conn.commit()
     conn.close()
     return True, None, logged_eps
+
+def delete_watch_log(log_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT work_id FROM watch_logs WHERE id = ?', (log_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False, '日志不存在'
+    work_id = row['work_id']
+    c.execute('DELETE FROM watch_logs WHERE id = ?', (log_id,))
+    conn.commit()
+    _recalc_work_progress(conn, work_id)
+    conn.close()
+    return True, None
+
+def update_watch_log(log_id, episode=None, watched_at=None):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM watch_logs WHERE id = ?', (log_id,))
+    log = c.fetchone()
+    if not log:
+        conn.close()
+        return False, '日志不存在'
+    work = get_work(log['work_id'])
+    if not work:
+        conn.close()
+        return False, '关联作品不存在'
+    new_ep = log['episode']
+    new_at = log['watched_at']
+    if episode is not None:
+        if work['type'] != 'movie':
+            ep, err = validate_episode(work, episode)
+            if err:
+                conn.close()
+                return False, err
+            new_ep = ep
+        else:
+            new_ep = episode
+    if watched_at is not None:
+        try:
+            dt = datetime.fromisoformat(watched_at)
+            new_at = dt.isoformat()
+        except ValueError:
+            conn.close()
+            return False, f'日期格式错误，应为 YYYY-MM-DD 或 YYYY-MM-DDTHH:MM'
+    c.execute('UPDATE watch_logs SET episode = ?, watched_at = ? WHERE id = ?',
+        (new_ep, new_at, log_id))
+    conn.commit()
+    _recalc_work_progress(conn, log['work_id'])
+    conn.close()
+    return True, None
 
 def rate_work(work_id, score):
     conn = get_conn()
@@ -263,7 +374,18 @@ def get_notes(work_id):
     conn.close()
     return rows
 
-def get_watch_logs(work_id=None, start_date=None, end_date=None):
+def get_ratings(work_id=None):
+    conn = get_conn()
+    c = conn.cursor()
+    if work_id:
+        c.execute('SELECT * FROM ratings WHERE work_id = ? ORDER BY rated_at DESC', (work_id,))
+    else:
+        c.execute('SELECT r.*, w.title as work_title FROM ratings r JOIN works w ON r.work_id = w.id ORDER BY rated_at DESC')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_watch_logs(work_id=None, start_date=None, end_date=None, year=None, month=None):
     conn = get_conn()
     c = conn.cursor()
     query = '''SELECT wl.*, w.title as work_title, w.type as work_type, w.platform as work_platform
@@ -272,13 +394,22 @@ def get_watch_logs(work_id=None, start_date=None, end_date=None):
     if work_id:
         query += ' AND wl.work_id = ?'
         params.append(work_id)
-    if start_date:
-        query += ' AND wl.watched_at >= ?'
-        params.append(start_date)
-    if end_date:
-        query += ' AND wl.watched_at <= ?'
-        params.append(end_date)
-    query += ' ORDER BY wl.watched_at DESC'
+    if year and month:
+        start = f'{year:04d}-{month:02d}-01'
+        if month == 12:
+            end = f'{year+1:04d}-01-01'
+        else:
+            end = f'{year:04d}-{month+1:02d}-01'
+        query += ' AND wl.watched_at >= ? AND wl.watched_at < ?'
+        params.extend([start, end])
+    else:
+        if start_date:
+            query += ' AND wl.watched_at >= ?'
+            params.append(start_date)
+        if end_date:
+            query += ' AND wl.watched_at <= ?'
+            params.append(end_date)
+    query += ' ORDER BY wl.watched_at DESC, wl.id DESC'
     c.execute(query, params)
     rows = c.fetchall()
     conn.close()
@@ -288,11 +419,15 @@ def _compute_next_air_dates(work, start, end):
     results = []
     if not work['air_weekday'] and not work['next_air_date']:
         return results
+    total = work['total_episodes'] or 0
+    if total > 0 and work['current_episode'] and work['current_episode'] >= total:
+        return results
     today = date.today()
     weekday_idx = None
     if work['air_weekday']:
         weekday_idx = WEEKDAYS.index(work['air_weekday'])
     episodes_per = work['episodes_per_air'] or 1
+    current_ep = work['current_episode'] or 0
 
     if work['next_air_date']:
         try:
@@ -300,7 +435,11 @@ def _compute_next_air_dates(work, start, end):
         except:
             d = None
         if d and start <= d <= end:
-            results.append((d, work['next_air_date'][:10], episodes_per, work))
+            from_ep = current_ep + 1
+            to_ep = current_ep + episodes_per
+            if total > 0:
+                to_ep = min(to_ep, total)
+            results.append((d, work['next_air_date'][:10], episodes_per, from_ep, to_ep, work))
 
     if weekday_idx is not None:
         cursor = max(start, today)
@@ -308,7 +447,11 @@ def _compute_next_air_dates(work, start, end):
             if cursor.weekday() == weekday_idx:
                 iso = cursor.isoformat()
                 if not (work['next_air_date'] and work['next_air_date'][:10] == iso):
-                    results.append((cursor, iso, episodes_per, work))
+                    from_ep = current_ep + 1
+                    to_ep = current_ep + episodes_per
+                    if total > 0:
+                        to_ep = min(to_ep, total)
+                    results.append((cursor, iso, episodes_per, from_ep, to_ep, work))
             cursor += timedelta(days=1)
     results.sort(key=lambda x: x[0])
     return results
@@ -368,8 +511,8 @@ def get_reminders():
         remind_end = today + timedelta(days=max(days_before, 1))
         events = _compute_next_air_dates(w, remind_start, remind_end)
         for ev in events:
-            d, iso, ep_cnt, _ = ev
-            upcoming.append((d, iso, ep_cnt, w))
+            d, iso, ep_cnt, from_ep, to_ep, _ = ev
+            upcoming.append((d, iso, ep_cnt, from_ep, to_ep, w))
     upcoming.sort(key=lambda x: x[0])
 
     c.execute('''SELECT * FROM works WHERE status = 'watching'
@@ -443,11 +586,10 @@ def get_monthly_stats(year, month):
         (start, end))
     scores = [row[0] for row in c.fetchall()]
     avg_rating = sum(scores) / len(scores) if scores else None
+    buckets = [('0-2', 0, 2), ('2-4', 2, 4), ('4-6', 4, 6), ('6-8', 6, 8), ('8-10', 8, 10)]
     rating_dist = {}
-    for s in scores:
-        bucket = int(s // 2) * 2
-        key = f'{bucket}-{bucket+1}'
-        rating_dist[key] = rating_dist.get(key, 0) + 1
+    for key, lo, hi in buckets:
+        rating_dist[key] = sum(1 for s in scores if lo <= s <= hi)
 
     conn.close()
     return {
@@ -489,3 +631,108 @@ def update_work(work_id, **kwargs):
         c.execute(f'UPDATE works SET {", ".join(updates)} WHERE id = ?', params)
         conn.commit()
     conn.close()
+
+def export_full_data():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM works ORDER BY id')
+    works = [dict(r) for r in c.fetchall()]
+    c.execute('SELECT * FROM watch_logs ORDER BY work_id, watched_at')
+    logs = [dict(r) for r in c.fetchall()]
+    c.execute('SELECT * FROM ratings ORDER BY work_id, rated_at')
+    ratings = [dict(r) for r in c.fetchall()]
+    c.execute('SELECT * FROM notes ORDER BY work_id, created_at')
+    notes = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return {'works': works, 'watch_logs': logs, 'ratings': ratings, 'notes': notes}
+
+def import_works_csv(path):
+    results = []
+    with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            title = (row.get('title') or row.get('标题') or '').strip()
+            if not title:
+                results.append({'row': dict(row), 'ok': False, 'error': '缺少标题'})
+                continue
+            work_type = (row.get('type') or row.get('类型') or 'series').strip().lower()
+            if work_type not in TYPE_OPTIONS:
+                work_type = 'series'
+            year_raw = row.get('year') or row.get('年份')
+            year = int(year_raw) if year_raw and str(year_raw).strip().isdigit() else None
+            platform = (row.get('platform') or row.get('平台') or '').strip() or None
+            ep_raw = row.get('episodes') or row.get('总集数') or row.get('集数')
+            total_episodes = int(ep_raw) if ep_raw and str(ep_raw).strip().isdigit() else 0
+            genre = (row.get('genre') or row.get('分类') or '').strip() or None
+            air_weekday = (row.get('air_weekday') or row.get('更新星期') or '').strip().lower()
+            if air_weekday not in WEEKDAYS:
+                air_weekday = None
+            ep_per_raw = row.get('episodes_per_air') or row.get('每次更新集数')
+            episodes_per_air = int(ep_per_raw) if ep_per_raw and str(ep_per_raw).strip().isdigit() else 1
+            rb_raw = row.get('remind_days_before') or row.get('提醒天数')
+            remind_days_before = int(rb_raw) if rb_raw and str(rb_raw).strip().isdigit() else 1
+            original_title = (row.get('original_title') or row.get('原名') or '').strip() or None
+            next_air = (row.get('next_air_date') or row.get('下次更新') or '').strip() or None
+            wid, err = add_work(
+                title=title, original_title=original_title, work_type=work_type,
+                year=year, platform=platform, total_episodes=total_episodes,
+                genre=genre, next_air_date=next_air,
+                air_weekday=air_weekday, episodes_per_air=episodes_per_air,
+                remind_days_before=remind_days_before
+            )
+            if err:
+                results.append({'row': dict(row), 'ok': False, 'error': err, 'duplicate': True})
+            else:
+                results.append({'row': dict(row), 'ok': True, 'id': wid})
+    return results
+
+def import_works_text(path):
+    results = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = [p.strip() for p in line.split('|')]
+            if not parts or not parts[0]:
+                results.append({'row': line, 'ok': False, 'error': f'第 {lineno} 行无法解析'})
+                continue
+            title = parts[0]
+            work_type = 'series'
+            year = None
+            platform = None
+            total_episodes = 0
+            air_weekday = None
+            remind_days_before = 1
+            for p in parts[1:]:
+                if p.lower() in TYPE_OPTIONS:
+                    work_type = p.lower()
+                elif p.isdigit() and len(p) == 4:
+                    year = int(p)
+                elif p.startswith('@'):
+                    platform = p[1:]
+                elif p.lower().startswith('e') and p[1:].isdigit():
+                    total_episodes = int(p[1:])
+                elif p.lower() in WEEKDAYS or p in ['周' + WEEKDAY_CN.get(p.lower(), '') for p in WEEKDAYS]:
+                    if p.lower() in WEEKDAYS:
+                        air_weekday = p.lower()
+                    else:
+                        for k, v in WEEKDAY_CN.items():
+                            if p == '周' + v:
+                                air_weekday = k
+                                break
+                elif p.isdigit():
+                    try:
+                        remind_days_before = int(p)
+                    except:
+                        pass
+            wid, err = add_work(
+                title=title, work_type=work_type, year=year, platform=platform,
+                total_episodes=total_episodes, air_weekday=air_weekday,
+                remind_days_before=remind_days_before
+            )
+            if err:
+                results.append({'row': line, 'ok': False, 'error': err, 'duplicate': True})
+            else:
+                results.append({'row': line, 'ok': True, 'id': wid})
+    return results

@@ -5,12 +5,30 @@
 import argparse
 import sys
 import os
+import json
+import io
 from datetime import datetime, timedelta, date
+
+if sys.platform.startswith('win'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+else:
+    try:
+        sys.stdout.reconfigure(errors='replace')
+        sys.stderr.reconfigure(errors='replace')
+    except Exception:
+        pass
 from database import (
     init_db, add_work, get_work, search_works, list_works,
     update_status, watch_episodes, rate_work, add_note, get_notes,
-    get_watch_logs, get_calendar_works, set_reminder, get_reminders,
+    get_watch_logs, get_watch_log, get_calendar_works, set_reminder, get_reminders,
     get_monthly_stats, delete_work, update_work, validate_episode,
+    delete_watch_log, update_watch_log, export_full_data,
+    import_works_csv, import_works_text, get_ratings, find_duplicate_work,
     STATUS_OPTIONS, TYPE_OPTIONS, WEEKDAYS, WEEKDAY_CN
 )
 
@@ -34,6 +52,8 @@ BOLD = '\033[1m'
 RED = '\033[91m'
 GREEN = '\033[92m'
 YELLOW = '\033[93m'
+CYAN = '\033[96m'
+DIM = '\033[2m'
 
 def color_status(s):
     return STATUS_COLORS.get(s, '') + s + RESET
@@ -77,6 +97,9 @@ def error(msg):
     print(f'{RED}错误：{msg}{RESET}', file=sys.stderr)
     sys.exit(1)
 
+def warn(msg):
+    print(f'{YELLOW}⚠ {msg}{RESET}')
+
 def cmd_search(args):
     results = search_works(args.keyword)
     if not results:
@@ -87,7 +110,16 @@ def cmd_search(args):
         print_work_row(w)
 
 def cmd_add(args):
-    work_id = add_work(
+    dups = find_duplicate_work(args.title, args.original_title, args.year)
+    if dups and not args.force:
+        print(f'{YELLOW}⚠ 检测到可能重复的作品：{RESET}')
+        for d in dups:
+            print_work_row(d)
+        ans = input('是否仍要继续添加？(y/N) ')
+        if ans.lower() != 'y':
+            print('已取消')
+            return
+    work_id, err = add_work(
         title=args.title,
         original_title=args.original_title,
         work_type=args.type,
@@ -99,7 +131,10 @@ def cmd_add(args):
         air_weekday=args.air_weekday,
         episodes_per_air=args.episodes_per_air or 1,
         remind_days_before=args.remind_before or 1,
+        skip_dup_check=True,
     )
+    if err:
+        error(err)
     work = get_work(work_id)
     print(f'{GREEN}✓{RESET} 已添加到片库：')
     print_work_row(work)
@@ -195,6 +230,72 @@ def cmd_list(args):
     for w in works:
         print_work_row(w)
 
+def cmd_history(args):
+    if args.undo:
+        if not args.log_id:
+            error('撤销需要提供 --log-id')
+        log = get_watch_log(args.log_id)
+        if not log:
+            error(f'未找到日志 ID={args.log_id}')
+        work = get_work(log['work_id'])
+        if not args.yes:
+            ep_str = f' 第 {log["episode"]} 集' if log['episode'] else ' 完整观看'
+            ans = input(f'确认撤销《{work["title"]}》{ep_str} ({log["watched_at"][:10]})？(y/N) ')
+            if ans.lower() != 'y':
+                print('已取消')
+                return
+        ok, err = delete_watch_log(args.log_id)
+        if not ok:
+            error(err)
+        work = get_work(log['work_id'])
+        print(f'{GREEN}✓{RESET} 已撤销，当前进度已重算：')
+        print_work_row(work)
+        return
+
+    if args.edit:
+        if not args.log_id:
+            error('修改需要提供 --log-id')
+        log = get_watch_log(args.log_id)
+        if not log:
+            error(f'未找到日志 ID={args.log_id}')
+        if args.episode is None and args.date is None:
+            print('未指定要修改的字段（--episode 或 --date）')
+            return
+        ok, err = update_watch_log(args.log_id, episode=args.episode, watched_at=args.date)
+        if not ok:
+            error(err)
+        log = get_watch_log(args.log_id)
+        work = get_work(log['work_id'])
+        ep_str = f' 第 {log["episode"]} 集' if log['episode'] else ' 完整观看'
+        print(f'{GREEN}✓{RESET} 日志已更新：{work["title"]}{ep_str} @ {log["watched_at"][:16]}')
+        print(f'  当前进度已重算：E{work["current_episode"]}，状态 {color_status(work["status"])}')
+        return
+
+    logs = get_watch_logs(
+        work_id=args.work_id,
+        start_date=args.from_date,
+        end_date=args.to_date,
+        year=args.year,
+        month=args.month,
+    )
+    if not logs:
+        print('没有匹配的观看记录')
+        return
+    header = [f'共 {len(logs)} 条记录']
+    if args.work_id:
+        w = get_work(args.work_id)
+        header.append(f'作品：{w["title"]}')
+    if args.year and args.month:
+        header.append(f'{args.year}年{args.month}月')
+    elif args.from_date or args.to_date:
+        header.append(f'{args.from_date or "始"} ~ {args.to_date or "今"}')
+    print(BOLD + '  '.join(header) + RESET)
+    for l in logs:
+        ep_str = f'  E{l["episode"]:<4}' if l['episode'] else '  电影'
+        wid = f'#{l["id"]:<5}'
+        print(f'  {DIM}{wid}{RESET} {l["watched_at"][:10]}  {color_type(f"[{l['work_type']:<5}]")}  {l["work_title"]}{ep_str}  {f"@{l['work_platform']}" if l["work_platform"] else ""}')
+    print(f'{DIM}使用 history --undo --log-id ID  撤销记录；history --edit --log-id ID --episode X --date YYYY-MM-DD 修改{RESET}')
+
 def cmd_calendar(args):
     start, end, events = get_calendar_works(args.range)
     range_names = {'today': '今日', 'week': '本周', 'month': '本月'}
@@ -204,19 +305,22 @@ def cmd_calendar(args):
         print(f'  {YELLOW}（此范围内暂无更新安排）{RESET}')
         return
     current_date = None
-    for d, iso, ep_cnt, w in events:
+    for d, iso, ep_cnt, from_ep, to_ep, w in events:
         if d != current_date:
             current_date = d
             weekday = WEEKDAY_CN[WEEKDAYS[d.weekday()]]
             today_mark = ' 【今天】' if d == date.today() else ''
             print(f'\n  {BOLD}{iso} 周{weekday}{today_mark}{RESET}')
         ep_str = ''
-        if ep_cnt and ep_cnt > 1:
+        if w['type'] in ('series', 'anime'):
+            if from_ep == to_ep:
+                ep_str = f' E{from_ep}'
+            else:
+                ep_str = f' E{from_ep}-{to_ep}'
+            if w['total_episodes']:
+                ep_str += f'/{w["total_episodes"]}'
+        if ep_cnt and ep_cnt > 1 and not ep_str:
             ep_str = f' 更新{ep_cnt}集'
-        elif w['type'] in ('series', 'anime'):
-            next_ep = (w['current_episode'] or 0) + 1
-            total_str = f'/{w["total_episodes"]}' if w['total_episodes'] else ''
-            ep_str = f' E{next_ep}{total_str}'
         print(f'    • {w["title"]} [{w["type"]}]{ep_str}')
 
 def cmd_stats(args):
@@ -253,9 +357,10 @@ def cmd_stats(args):
     if s["rating_dist"]:
         print()
         print(f'{BOLD}评分分布：{RESET}')
-        sorted_buckets = sorted(s["rating_dist"].items())
-        max_cnt = max(c for _, c in sorted_buckets) or 1
-        for key, cnt in sorted_buckets:
+        ordered = [k for k in ['0-2', '2-4', '4-6', '6-8', '8-10'] if k in s["rating_dist"]]
+        max_cnt = max(s["rating_dist"].values()) or 1
+        for key in ordered:
+            cnt = s["rating_dist"][key]
             bar = '█' * int(cnt / max_cnt * 20)
             print(f'  {key}分  {cnt}部  {bar}')
 
@@ -267,6 +372,54 @@ def cmd_stats(args):
             print(f'  {i:>2}. {w["title"]}  {w["ep_cnt"]}{ep_unit}')
 
 def cmd_export(args):
+    if args.full:
+        data = export_full_data()
+        if not data['works']:
+            print('没有可导出的内容')
+            return
+        if args.format == 'json':
+            text = json.dumps(data, ensure_ascii=False, indent=2)
+        else:
+            lines = []
+            lines.append(f'# filmtrack 完整导出 - {datetime.now().strftime("%Y-%m-%d %H:%M")}')
+            lines.append(f'# works: {len(data["works"])}, watch_logs: {len(data["watch_logs"])}, ratings: {len(data["ratings"])}, notes: {len(data["notes"])}')
+            lines.append('')
+            lines.append('## WORKS')
+            for w in data['works']:
+                fields = [str(w.get('id','')), w.get('title',''), w.get('original_title') or '',
+                          w.get('type',''), str(w.get('year') or ''), w.get('platform') or '',
+                          str(w.get('total_episodes') or 0), w.get('status',''),
+                          str(w.get('current_episode') or 0),
+                          str(w.get('rating') if w.get('rating') is not None else ''),
+                          w.get('genre') or '', w.get('added_at','')[:10],
+                          w.get('last_watched_at','')[:10] if w.get('last_watched_at') else '',
+                          w.get('next_air_date') or '', w.get('air_weekday') or '',
+                          str(w.get('episodes_per_air') or 1),
+                          str(w.get('reminder_set') or 0),
+                          str(w.get('remind_days_before') or 1),
+                          (w.get('notes') or '').replace('\n', ' / ')]
+                lines.append('|'.join(fields))
+            lines.append('')
+            lines.append('## WATCH_LOGS')
+            for l in data['watch_logs']:
+                lines.append(f'{l["work_id"]}|{l["episode"] if l["episode"] is not None else ""}|{l["watched_at"]}')
+            lines.append('')
+            lines.append('## RATINGS')
+            for r in data['ratings']:
+                lines.append(f'{r["work_id"]}|{r["score"]}|{r["rated_at"]}')
+            lines.append('')
+            lines.append('## NOTES')
+            for n in data['notes']:
+                lines.append(f'{n["work_id"]}|{n["created_at"]}|{n["content"].replace(chr(10), " / ")}')
+            text = '\n'.join(lines)
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(text)
+            print(f'{GREEN}✓{RESET} 完整数据已导出到 {args.output}')
+        else:
+            print(text)
+        return
+
     works = list_works(status=args.status, work_type=args.type, platform=args.platform)
     if not works:
         print('没有可导出的内容')
@@ -294,6 +447,17 @@ def cmd_export(args):
         if w['genre']:
             parts.append(f'类型: {w["genre"]}')
         lines.append(' | '.join(parts))
+        logs = get_watch_logs(work_id=w['id'])
+        if logs:
+            lines.append(f'  观看历史:')
+            for l in logs:
+                ep = f'E{l["episode"]} ' if l['episode'] else ''
+                lines.append(f'    {l["watched_at"][:10]} {ep}')
+        ratings = get_ratings(work_id=w['id'])
+        if ratings:
+            lines.append(f'  评分记录:')
+            for r in ratings:
+                lines.append(f'    {r["rated_at"][:10]} {r["score"]}/10')
         if w['notes']:
             lines.append(f'  笔记:')
             for note_line in w['notes'].split('\n'):
@@ -306,6 +470,36 @@ def cmd_export(args):
         print(f'{GREEN}✓{RESET} 已导出到 {args.output}')
     else:
         print(output)
+
+def cmd_import(args):
+    path = args.file
+    if not os.path.exists(path):
+        error(f'文件不存在：{path}')
+    fmt = args.format
+    if not fmt:
+        if path.lower().endswith('.csv'):
+            fmt = 'csv'
+        else:
+            fmt = 'text'
+    if fmt == 'csv':
+        results = import_works_csv(path)
+    else:
+        results = import_works_text(path)
+    ok_cnt = sum(1 for r in results if r['ok'])
+    dup_cnt = sum(1 for r in results if (not r['ok']) and r.get('duplicate'))
+    err_cnt = len(results) - ok_cnt - dup_cnt
+    print(f'导入完成：成功 {GREEN}{ok_cnt}{RESET}，重复 {YELLOW}{dup_cnt}{RESET}，错误 {RED}{err_cnt}{RESET}')
+    for r in results:
+        row_val = r.get('row', '')
+        if isinstance(row_val, dict):
+            row_val = ' | '.join(f'{k}={v}' for k, v in list(row_val.items())[:4])
+        row_str = str(row_val)[:60]
+        if r['ok']:
+            print(f'  {GREEN}✓{RESET} [ID={r["id"]}] {row_str}')
+        elif r.get('duplicate'):
+            print(f'  {YELLOW}⏭{RESET} 重复跳过: {r["error"]}')
+        else:
+            print(f'  {RED}✗{RESET} {row_str[:40]} → {r["error"]}')
 
 def cmd_remind(args):
     if args.set is not None or args.days_before is not None:
@@ -328,7 +522,7 @@ def cmd_remind(args):
     print(f'{BOLD}📺 即将开播/更新：{RESET}')
     if upcoming:
         today = date.today()
-        for d, iso, ep_cnt, w in upcoming:
+        for d, iso, ep_cnt, from_ep, to_ep, w in upcoming:
             days_left = (d - today).days
             if days_left == 0:
                 day_label = '今天'
@@ -336,7 +530,14 @@ def cmd_remind(args):
                 day_label = '明天'
             else:
                 day_label = f'{days_left}天后'
-            ep_str = f'（更新{ep_cnt}集）' if ep_cnt and ep_cnt > 1 else ''
+            ep_str = ''
+            if w['type'] in ('series', 'anime'):
+                if from_ep == to_ep:
+                    ep_str = f' E{from_ep}'
+                else:
+                    ep_str = f' E{from_ep}-{to_ep}'
+            elif ep_cnt and ep_cnt > 1:
+                ep_str = f'（更新{ep_cnt}集）'
             print(f'  • {iso}（{day_label}）  {w["title"]}{ep_str}')
     else:
         print(f'  {YELLOW}暂无{RESET}')
@@ -387,13 +588,21 @@ def cmd_show(args):
         print(f'{BOLD}笔记：{RESET}')
         for n in notes:
             print(f'  [{n["created_at"][:10]}] {n["content"]}')
+    ratings = get_ratings(work_id=args.id)
+    if ratings:
+        print()
+        print(f'{BOLD}评分记录：{RESET}')
+        for r in ratings:
+            print(f'  [{r["rated_at"][:10]}] {stars(r["score"])} {r["score"]}/10')
     logs = get_watch_logs(work_id=args.id)
     if logs:
         print()
-        print(f'{BOLD}最近观看记录（{len(logs)} 条）：{RESET}')
-        for l in logs[:5]:
-            ep_str = f' E{l["episode"]}' if l['episode'] else ''
-            print(f'  {l["watched_at"][:10]}{ep_str}')
+        print(f'{BOLD}观看记录（{len(logs)} 条）：{RESET}')
+        for l in logs[:10]:
+            ep_str = f' E{l["episode"]}' if l['episode'] else ' 电影'
+            print(f'  [#{l["id"]}] {l["watched_at"][:10]}{ep_str}')
+        if len(logs) > 10:
+            print(f'  {DIM}... 还有 {len(logs)-10} 条，使用 filmtrack history --work-id {args.id} 查看全部{RESET}')
     print(f'{BOLD}{"="*52}{RESET}')
 
 def cmd_edit(args):
@@ -442,18 +651,15 @@ def main():
         epilog='''
 示例：
   filmtrack add "怪奇物语" -t series -e 34 -p Netflix -y 2016 --air-weekday thu --episodes-per-air 1
-  filmtrack search 物语
-  filmtrack watch 1
-  filmtrack watch 1 --count 3
-  filmtrack watch 1 --date 2026-06-01
-  filmtrack watch 2 --movie
-  filmtrack rate 1 9.5
-  filmtrack note 1 "第四季太精彩了！"
-  filmtrack list -s watching
-  filmtrack calendar --range week
-  filmtrack stats -m 5
-  filmtrack remind --id 1 --set on --days-before 2
-  filmtrack export -o mylist.txt
+  filmtrack watch 1 -c 3
+  filmtrack watch 1 -d 2026-06-01
+  filmtrack history -w 1
+  filmtrack history --undo --log-id 42
+  filmtrack history --edit --log-id 42 --date 2026-05-20
+  filmtrack import list.csv
+  filmtrack export --full -f json -o backup.json
+  filmtrack calendar -r month
+  filmtrack stats -m 6
         '''
     )
     sub = parser.add_subparsers(dest='command')
@@ -462,32 +668,33 @@ def main():
     p_search.add_argument('keyword', help='搜索关键词')
     p_search.set_defaults(func=cmd_search)
 
-    p_add = sub.add_parser('add', help='添加作品到片库')
+    p_add = sub.add_parser('add', help='添加作品到片库（自动检测重复）')
     p_add.add_argument('title', help='作品名称')
     p_add.add_argument('--original-title', '-ot', help='原名/外文名称')
     p_add.add_argument('--type', '-t', choices=TYPE_OPTIONS, default='series', help='类型')
     p_add.add_argument('--year', '-y', type=int, help='年份')
-    p_add.add_argument('--platform', '-p', help='播放平台（如 Netflix、HBO、B站）')
+    p_add.add_argument('--platform', '-p', help='播放平台')
     p_add.add_argument('--episodes', '-e', type=int, help='总集数')
-    p_add.add_argument('--genre', '-g', help='分类标签（如 科幻/悬疑）')
+    p_add.add_argument('--genre', '-g', help='分类标签')
     p_add.add_argument('--next-air', help='下次更新日期 YYYY-MM-DD')
-    p_add.add_argument('--air-weekday', choices=WEEKDAYS, help='每周几更新（mon/tue/wed/thu/fri/sat/sun）')
-    p_add.add_argument('--episodes-per-air', type=int, help='每次更新集数（默认 1）')
-    p_add.add_argument('--remind-before', type=int, help='开播前提前几天提醒（默认 1）')
+    p_add.add_argument('--air-weekday', choices=WEEKDAYS, help='每周几更新')
+    p_add.add_argument('--episodes-per-air', type=int, help='每次更新集数')
+    p_add.add_argument('--remind-before', type=int, help='提前几天提醒')
+    p_add.add_argument('--force', '-f', action='store_true', help='跳过重复检测')
     p_add.set_defaults(func=cmd_add)
 
-    p_watch = sub.add_parser('watch', help='记录观看（支持多集、补记日期、电影模式）')
+    p_watch = sub.add_parser('watch', help='记录观看')
     p_watch.add_argument('id', type=int, help='作品 ID')
-    p_watch.add_argument('episode', type=int, nargs='?', help='起始集数（默认下一集）')
-    p_watch.add_argument('--count', '-c', type=int, help='连续观看集数（默认 1）')
-    p_watch.add_argument('--date', '-d', help='补记观看日期 YYYY-MM-DD（默认今天）')
-    p_watch.add_argument('--movie', '-m', action='store_true', help='标记为电影完整观看（无需集数）')
+    p_watch.add_argument('episode', type=int, nargs='?', help='起始集数')
+    p_watch.add_argument('--count', '-c', type=int, help='连续观看集数（超过总集数会报错而非截断）')
+    p_watch.add_argument('--date', '-d', help='补记观看日期 YYYY-MM-DD')
+    p_watch.add_argument('--movie', '-m', action='store_true', help='电影完整观看')
     p_watch.set_defaults(func=cmd_watch)
 
     p_status = sub.add_parser('status', help='设置作品状态')
     p_status.add_argument('id', type=int, help='作品 ID')
     p_status.add_argument('status', choices=STATUS_OPTIONS, help='状态')
-    p_status.add_argument('--episode', '-e', type=int, help='同时设置当前集数（按总集数严格校验）')
+    p_status.add_argument('--episode', '-e', type=int, help='设置当前集数（严格校验）')
     p_status.set_defaults(func=cmd_status)
 
     p_rate = sub.add_parser('rate', help='给作品打分 (0-10)')
@@ -501,32 +708,53 @@ def main():
     p_note.add_argument('--view', '-v', action='store_true', help='查看笔记')
     p_note.set_defaults(func=cmd_note)
 
+    p_hist = sub.add_parser('history', help='管理观看历史：查看/撤销/修改')
+    p_hist.add_argument('--work-id', '-w', type=int, help='按作品筛选')
+    p_hist.add_argument('--year', type=int, help='按年份筛选')
+    p_hist.add_argument('--month', type=int, help='按月份筛选')
+    p_hist.add_argument('--from-date', help='起始日期 YYYY-MM-DD')
+    p_hist.add_argument('--to-date', help='结束日期 YYYY-MM-DD')
+    p_hist.add_argument('--undo', action='store_true', help='撤销一条记录（需 --log-id）')
+    p_hist.add_argument('--edit', action='store_true', help='修改一条记录（需 --log-id + --episode/--date）')
+    p_hist.add_argument('--log-id', type=int, help='日志 ID')
+    p_hist.add_argument('--episode', type=int, help='修改后的集数')
+    p_hist.add_argument('--date', '-d', help='修改后的日期 YYYY-MM-DD')
+    p_hist.add_argument('--yes', '-y', action='store_true', help='跳过撤销确认')
+    p_hist.set_defaults(func=cmd_history)
+
     p_list = sub.add_parser('list', help='列出片单')
     p_list.add_argument('--status', '-s', choices=STATUS_OPTIONS, help='按状态筛选')
     p_list.add_argument('--type', '-t', choices=TYPE_OPTIONS, help='按类型筛选')
     p_list.add_argument('--platform', '-p', help='按平台筛选')
     p_list.set_defaults(func=cmd_list)
 
-    p_cal = sub.add_parser('calendar', help='查看更新日历（today/week/month）')
+    p_cal = sub.add_parser('calendar', help='查看更新日历（已完结作品不再显示）')
     p_cal.add_argument('--range', '-r', choices=['today', 'week', 'month'], default='week',
-                       help='查看范围：today=今天，week=本周（默认），month=本月')
+                       help='today/week/month')
     p_cal.set_defaults(func=cmd_calendar)
 
-    p_stats = sub.add_parser('stats', help='查看月度观影统计')
-    p_stats.add_argument('--year', '-y', type=int, help='年份（默认今年）')
-    p_stats.add_argument('--month', '-m', type=int, help='月份（默认本月）')
+    p_stats = sub.add_parser('stats', help='月度观影统计')
+    p_stats.add_argument('--year', '-y', type=int, help='年份')
+    p_stats.add_argument('--month', '-m', type=int, help='月份')
     p_stats.set_defaults(func=cmd_stats)
 
-    p_export = sub.add_parser('export', help='导出片单为文本')
-    p_export.add_argument('--output', '-o', help='输出文件路径（默认打印到终端）')
-    p_export.add_argument('--status', '-s', choices=STATUS_OPTIONS, help='按状态筛选')
-    p_export.add_argument('--type', '-t', choices=TYPE_OPTIONS, help='按类型筛选')
-    p_export.add_argument('--platform', '-p', help='按平台筛选')
+    p_export = sub.add_parser('export', help='导出（简单清单或完整备份）')
+    p_export.add_argument('--output', '-o', help='输出文件路径')
+    p_export.add_argument('--status', '-s', choices=STATUS_OPTIONS)
+    p_export.add_argument('--type', '-t', choices=TYPE_OPTIONS)
+    p_export.add_argument('--platform', '-p')
+    p_export.add_argument('--full', '-f', action='store_true', help='完整导出（含观看日志、评分、笔记）便于迁移')
+    p_export.add_argument('--format', choices=['text', 'json'], default='text', help='完整导出时的格式')
     p_export.set_defaults(func=cmd_export)
 
+    p_import = sub.add_parser('import', help='从 CSV 或简单文本批量导入作品（自动检测重复）')
+    p_import.add_argument('file', help='输入文件路径')
+    p_import.add_argument('--format', '-f', choices=['csv', 'text'], help='文件格式（默认按扩展名推断）')
+    p_import.set_defaults(func=cmd_import)
+
     p_remind = sub.add_parser('remind', help='查看和设置提醒')
-    p_remind.add_argument('--id', type=int, help='作品 ID（配合 --set 使用）')
-    p_remind.add_argument('--set', type=lambda x: x.lower() in ('1','true','yes','on'), help='开启/关闭提醒 (on/off)')
+    p_remind.add_argument('--id', type=int, help='作品 ID')
+    p_remind.add_argument('--set', type=lambda x: x.lower() in ('1','true','yes','on'), help='on/off')
     p_remind.add_argument('--days-before', type=int, help='提前几天提醒')
     p_remind.set_defaults(func=cmd_remind)
 
@@ -536,17 +764,17 @@ def main():
 
     p_edit = sub.add_parser('edit', help='编辑作品信息')
     p_edit.add_argument('id', type=int, help='作品 ID')
-    p_edit.add_argument('--title', help='新标题')
-    p_edit.add_argument('--original-title', '-ot', help='新原名')
-    p_edit.add_argument('--type', '-t', choices=TYPE_OPTIONS, help='新类型')
-    p_edit.add_argument('--year', '-y', type=int, help='新年份')
-    p_edit.add_argument('--platform', '-p', help='新平台')
-    p_edit.add_argument('--episodes', '-e', type=int, help='新总集数')
-    p_edit.add_argument('--next-air', help='新下次更新日期')
-    p_edit.add_argument('--genre', '-g', help='新分类标签')
-    p_edit.add_argument('--air-weekday', choices=WEEKDAYS, help='新每周几更新')
-    p_edit.add_argument('--episodes-per-air', type=int, help='新每次更新集数')
-    p_edit.add_argument('--remind-before', type=int, help='新提前提醒天数')
+    p_edit.add_argument('--title')
+    p_edit.add_argument('--original-title', '-ot')
+    p_edit.add_argument('--type', '-t', choices=TYPE_OPTIONS)
+    p_edit.add_argument('--year', '-y', type=int)
+    p_edit.add_argument('--platform', '-p')
+    p_edit.add_argument('--episodes', '-e', type=int)
+    p_edit.add_argument('--next-air')
+    p_edit.add_argument('--genre', '-g')
+    p_edit.add_argument('--air-weekday', choices=WEEKDAYS)
+    p_edit.add_argument('--episodes-per-air', type=int)
+    p_edit.add_argument('--remind-before', type=int)
     p_edit.set_defaults(func=cmd_edit)
 
     p_del = sub.add_parser('delete', help='删除作品')
