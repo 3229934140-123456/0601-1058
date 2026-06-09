@@ -416,12 +416,11 @@ def get_watch_logs(work_id=None, start_date=None, end_date=None, year=None, mont
     return rows
 
 def _compute_next_air_dates(work, start, end):
-    results = []
     if not work['air_weekday'] and not work['next_air_date']:
-        return results
+        return []
     total = work['total_episodes'] or 0
     if total > 0 and work['current_episode'] and work['current_episode'] >= total:
-        return results
+        return []
     today = date.today()
     weekday_idx = None
     if work['air_weekday']:
@@ -429,31 +428,35 @@ def _compute_next_air_dates(work, start, end):
     episodes_per = work['episodes_per_air'] or 1
     current_ep = work['current_episode'] or 0
 
+    air_dates = []
     if work['next_air_date']:
         try:
             d = date.fromisoformat(work['next_air_date'][:10])
+            if start <= d <= end:
+                air_dates.append(d)
         except:
-            d = None
-        if d and start <= d <= end:
-            from_ep = current_ep + 1
-            to_ep = current_ep + episodes_per
-            if total > 0:
-                to_ep = min(to_ep, total)
-            results.append((d, work['next_air_date'][:10], episodes_per, from_ep, to_ep, work))
+            pass
 
     if weekday_idx is not None:
         cursor = max(start, today)
         while cursor <= end:
             if cursor.weekday() == weekday_idx:
-                iso = cursor.isoformat()
-                if not (work['next_air_date'] and work['next_air_date'][:10] == iso):
-                    from_ep = current_ep + 1
-                    to_ep = current_ep + episodes_per
-                    if total > 0:
-                        to_ep = min(to_ep, total)
-                    results.append((cursor, iso, episodes_per, from_ep, to_ep, work))
+                if not (work['next_air_date'] and work['next_air_date'][:10] == cursor.isoformat()):
+                    air_dates.append(cursor)
             cursor += timedelta(days=1)
-    results.sort(key=lambda x: x[0])
+
+    air_dates.sort()
+    results = []
+    ep_offset = 0
+    for d in air_dates:
+        from_ep = current_ep + 1 + ep_offset
+        to_ep = current_ep + episodes_per + ep_offset
+        if total > 0:
+            if from_ep > total:
+                break
+            to_ep = min(to_ep, total)
+        results.append((d, d.isoformat(), episodes_per, from_ep, to_ep, work))
+        ep_offset += episodes_per
     return results
 
 def get_calendar_works(range_type='week'):
@@ -526,83 +529,10 @@ def get_reminders():
 def get_monthly_stats(year, month):
     start_dt = date(year, month, 1)
     if month == 12:
-        end_dt = date(year + 1, 1, 1)
+        end_dt = date(year, 12, 31)
     else:
-        end_dt = date(year, month + 1, 1)
-    start = start_dt.isoformat()
-    end = end_dt.isoformat()
-
-    conn = get_conn()
-    c = conn.cursor()
-
-    c.execute('''SELECT COUNT(DISTINCT wl.work_id) as works_watched,
-        COUNT(wl.id) as episodes_watched
-        FROM watch_logs wl WHERE wl.watched_at >= ? AND wl.watched_at < ?''',
-        (start, end))
-    totals = c.fetchone()
-
-    c.execute('''SELECT DATE(wl.watched_at) as d, COUNT(*) as cnt
-        FROM watch_logs wl
-        WHERE wl.watched_at >= ? AND wl.watched_at < ?
-        GROUP BY DATE(wl.watched_at) ORDER BY d ASC''',
-        (start, end))
-    daily = c.fetchall()
-    watch_days = len(daily)
-    streak = 0
-    max_streak = 0
-    prev = None
-    for row in daily:
-        d = date.fromisoformat(row['d'])
-        if prev and (d - prev).days == 1:
-            streak += 1
-        else:
-            streak = 1
-        max_streak = max(max_streak, streak)
-        prev = d
-
-    c.execute('''SELECT w.platform, COUNT(wl.id) as cnt
-        FROM watch_logs wl JOIN works w ON wl.work_id = w.id
-        WHERE wl.watched_at >= ? AND wl.watched_at < ? AND w.platform IS NOT NULL
-        GROUP BY w.platform ORDER BY cnt DESC''',
-        (start, end))
-    by_platform = c.fetchall()
-
-    c.execute('''SELECT w.type, COUNT(DISTINCT wl.work_id) as works_cnt, COUNT(wl.id) as ep_cnt
-        FROM watch_logs wl JOIN works w ON wl.work_id = w.id
-        WHERE wl.watched_at >= ? AND wl.watched_at < ?
-        GROUP BY w.type ORDER BY ep_cnt DESC''',
-        (start, end))
-    by_type = c.fetchall()
-
-    c.execute('''SELECT w.id, w.title, w.type, COUNT(wl.id) as ep_cnt
-        FROM watch_logs wl JOIN works w ON wl.work_id = w.id
-        WHERE wl.watched_at >= ? AND wl.watched_at < ?
-        GROUP BY w.id ORDER BY ep_cnt DESC LIMIT 10''',
-        (start, end))
-    top_works = c.fetchall()
-
-    c.execute('''SELECT r.score
-        FROM ratings r WHERE r.rated_at >= ? AND r.rated_at < ?''',
-        (start, end))
-    scores = [row[0] for row in c.fetchall()]
-    avg_rating = sum(scores) / len(scores) if scores else None
-    buckets = [('0-2', 0, 2), ('2-4', 2, 4), ('4-6', 4, 6), ('6-8', 6, 8), ('8-10', 8, 10)]
-    rating_dist = {}
-    for key, lo, hi in buckets:
-        rating_dist[key] = sum(1 for s in scores if lo <= s <= hi)
-
-    conn.close()
-    return {
-        'totals': totals,
-        'watch_days': watch_days,
-        'max_streak': max_streak,
-        'by_platform': by_platform,
-        'by_type': by_type,
-        'top_works': top_works,
-        'avg_rating': avg_rating,
-        'rating_dist': rating_dist,
-        'daily_count': daily,
-    }
+        end_dt = date(year, month + 1, 1) - timedelta(days=1)
+    return get_stats(start_dt, end_dt)
 
 def delete_work(work_id):
     conn = get_conn()
@@ -735,4 +665,273 @@ def import_works_text(path):
                 results.append({'row': line, 'ok': False, 'error': err, 'duplicate': True})
             else:
                 results.append({'row': line, 'ok': True, 'id': wid})
+    return results
+
+def list_works(status=None, work_type=None, platform=None,
+               min_rating=None, max_rating=None,
+               has_notes=None, stalled_days=None, reminder_only=None):
+    conn = get_conn()
+    c = conn.cursor()
+    query = 'SELECT * FROM works WHERE 1=1'
+    params = []
+    if status:
+        query += ' AND status = ?'
+        params.append(status)
+    if work_type:
+        query += ' AND type = ?'
+        params.append(work_type)
+    if platform:
+        query += ' AND platform = ?'
+        params.append(platform)
+    if min_rating is not None:
+        query += ' AND rating >= ?'
+        params.append(min_rating)
+    if max_rating is not None:
+        query += ' AND rating <= ?'
+        params.append(max_rating)
+    if has_notes is True:
+        query += " AND (notes IS NOT NULL AND notes <> '')"
+    elif has_notes is False:
+        query += " AND (notes IS NULL OR notes = '')"
+    if reminder_only is True:
+        query += ' AND reminder_set = 1'
+    elif reminder_only is False:
+        query += ' AND (reminder_set IS NULL OR reminder_set = 0)'
+    if stalled_days is not None and stalled_days > 0:
+        cutoff = (date.today() - timedelta(days=stalled_days)).isoformat()
+        query += ' AND status IN (?, ?) AND (last_watched_at IS NULL OR DATE(last_watched_at) < ?)'
+        params.extend(['watching', 'on-hold', cutoff])
+    query += ' ORDER BY last_watched_at DESC, added_at DESC'
+    c.execute(query, params)
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_duplicate_works():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''SELECT LOWER(COALESCE(title,'')) as key, GROUP_CONCAT(id) as ids, COUNT(*) as cnt
+        FROM works GROUP BY key HAVING cnt > 1 ORDER BY cnt DESC''')
+    groups = []
+    for row in c.fetchall():
+        ids = [int(x) for x in row['ids'].split(',')]
+        c.execute('SELECT * FROM works WHERE id IN ({}) ORDER BY id'.format(','.join('?' * len(ids))), ids)
+        groups.append(list(c.fetchall()))
+    conn.close()
+    return groups
+
+def get_organize_report():
+    report = {}
+    report['duplicates'] = get_duplicate_works()
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''SELECT * FROM works
+        WHERE type IN ('series','anime') AND (total_episodes IS NULL OR total_episodes = 0)
+        ORDER BY id''')
+    report['missing_episodes'] = c.fetchall()
+    c.execute('''SELECT * FROM works
+        WHERE total_episodes > 0 AND COALESCE(current_episode,0) >= total_episodes AND status != 'completed'
+        ORDER BY id''')
+    report['finished_not_completed'] = c.fetchall()
+    c.execute('''SELECT * FROM works
+        WHERE air_weekday IS NOT NULL AND total_episodes > 0
+        AND COALESCE(current_episode,0) >= total_episodes
+        ORDER BY id''')
+    report['aired_but_completed'] = c.fetchall()
+    cutoff = (date.today() - timedelta(days=60)).isoformat()
+    c.execute('''SELECT * FROM works
+        WHERE status = 'watching' AND (last_watched_at IS NULL OR DATE(last_watched_at) < ?)
+        ORDER BY last_watched_at ASC''', (cutoff,))
+    report['long_stalled'] = c.fetchall()
+    conn.close()
+    return report
+
+def get_stats(start_date, end_date):
+    start = start_date.isoformat()
+    end = (end_date + timedelta(days=1)).isoformat()
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute('''SELECT COUNT(DISTINCT wl.work_id) as works_watched,
+        COUNT(wl.id) as episodes_watched
+        FROM watch_logs wl WHERE wl.watched_at >= ? AND wl.watched_at < ?''',
+        (start, end))
+    totals = c.fetchone()
+
+    c.execute('''SELECT DATE(wl.watched_at) as d, COUNT(*) as cnt
+        FROM watch_logs wl
+        WHERE wl.watched_at >= ? AND wl.watched_at < ?
+        GROUP BY DATE(wl.watched_at) ORDER BY d ASC''',
+        (start, end))
+    daily = c.fetchall()
+    watch_days = len(daily)
+    streak = 0
+    max_streak = 0
+    prev = None
+    for row in daily:
+        d = date.fromisoformat(row['d'])
+        if prev and (d - prev).days == 1:
+            streak += 1
+        else:
+            streak = 1
+        max_streak = max(max_streak, streak)
+        prev = d
+
+    c.execute('''SELECT w.platform, COUNT(wl.id) as cnt
+        FROM watch_logs wl JOIN works w ON wl.work_id = w.id
+        WHERE wl.watched_at >= ? AND wl.watched_at < ? AND w.platform IS NOT NULL
+        GROUP BY w.platform ORDER BY cnt DESC''',
+        (start, end))
+    by_platform = c.fetchall()
+
+    c.execute('''SELECT w.type, COUNT(DISTINCT wl.work_id) as works_cnt, COUNT(wl.id) as ep_cnt
+        FROM watch_logs wl JOIN works w ON wl.work_id = w.id
+        WHERE wl.watched_at >= ? AND wl.watched_at < ?
+        GROUP BY w.type ORDER BY ep_cnt DESC''',
+        (start, end))
+    by_type = c.fetchall()
+
+    c.execute('''SELECT w.id, w.title, w.type, w.rating, COUNT(wl.id) as ep_cnt
+        FROM watch_logs wl JOIN works w ON wl.work_id = w.id
+        WHERE wl.watched_at >= ? AND wl.watched_at < ?
+        GROUP BY w.id ORDER BY ep_cnt DESC LIMIT 20''',
+        (start, end))
+    top_works = c.fetchall()
+
+    c.execute('''SELECT r.score, r.work_id, w.title
+        FROM ratings r JOIN works w ON r.work_id = w.id
+        WHERE r.rated_at >= ? AND r.rated_at < ? ORDER BY r.score DESC''',
+        (start, end))
+    rated = c.fetchall()
+    scores = [r['score'] for r in rated]
+    avg_rating = sum(scores) / len(scores) if scores else None
+    buckets = [('0-2', 0, 2, False), ('2-4', 2, 4, False), ('4-6', 4, 6, False),
+               ('6-8', 6, 8, False), ('8-10', 8, 10, True)]
+    rating_dist = {}
+    for key, lo, hi, inclusive in buckets:
+        if inclusive:
+            rating_dist[key] = sum(1 for s in scores if lo <= s <= hi)
+        else:
+            rating_dist[key] = sum(1 for s in scores if lo <= s < hi)
+
+    conn.close()
+    return {
+        'start_date': start_date,
+        'end_date': end_date,
+        'totals': totals,
+        'watch_days': watch_days,
+        'max_streak': max_streak,
+        'by_platform': by_platform,
+        'by_type': by_type,
+        'top_works': top_works,
+        'rated_works': rated,
+        'avg_rating': avg_rating,
+        'rating_dist': rating_dist,
+        'daily_count': daily,
+    }
+
+def get_yearly_stats(year):
+    return get_stats(date(year, 1, 1), date(year, 12, 31))
+
+def restore_full_data(data, conflict='skip'):
+    """从 export --full 导出的 JSON 完整恢复。conflict: skip/merge/create"""
+    results = []
+    conn = get_conn()
+    try:
+        works_data = data.get('works', [])
+        logs_data = data.get('watch_logs', [])
+        ratings_data = data.get('ratings', [])
+        notes_data = data.get('notes', [])
+        id_map = {}
+        for w in works_data:
+            dups = find_duplicate_work(w.get('title'), w.get('original_title'), w.get('year'))
+            if dups:
+                existing = dups[0]
+                if conflict == 'skip':
+                    results.append({'action': 'skip', 'title': w.get('title'),
+                                    'existing_id': existing['id'], 'reason': '已存在同名作品'})
+                    id_map[w['id']] = existing['id']
+                    continue
+                elif conflict == 'merge':
+                    id_map[w['id']] = existing['id']
+                    results.append({'action': 'merge', 'title': w.get('title'),
+                                    'existing_id': existing['id'],
+                                    'reason': '合并历史/评分/笔记到已有作品'})
+                    continue
+                # conflict == 'create': 继续往下新建
+            c = conn.cursor()
+            c.execute('''INSERT INTO works (title, original_title, type, year, platform,
+                total_episodes, status, current_episode, rating, genre, added_at,
+                last_watched_at, next_air_date, air_weekday, episodes_per_air,
+                reminder_set, remind_days_before, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (w.get('title'), w.get('original_title'), w.get('type','series'),
+                 w.get('year'), w.get('platform'), w.get('total_episodes') or 0,
+                 w.get('status','to-watch'), w.get('current_episode') or 0,
+                 w.get('rating'), w.get('genre'), w.get('added_at'),
+                 w.get('last_watched_at'), w.get('next_air_date'),
+                 w.get('air_weekday'), w.get('episodes_per_air') or 1,
+                 w.get('reminder_set') or 0, w.get('remind_days_before') or 1,
+                 w.get('notes') or ''))
+            new_id = c.lastrowid
+            id_map[w['id']] = new_id
+            results.append({'action': 'create', 'title': w.get('title'), 'new_id': new_id})
+        conn.commit()
+
+        for l in logs_data:
+            old_wid = l.get('work_id')
+            if old_wid not in id_map:
+                continue
+            new_wid = id_map[old_wid]
+            c = conn.cursor()
+            if conflict == 'merge':
+                c.execute('''SELECT id FROM watch_logs
+                    WHERE work_id = ? AND episode IS ? AND watched_at = ?''',
+                    (new_wid, l.get('episode'), l.get('watched_at')))
+                if c.fetchone():
+                    continue
+            c.execute('''INSERT INTO watch_logs (work_id, episode, watched_at)
+                VALUES (?, ?, ?)''', (new_wid, l.get('episode'), l.get('watched_at')))
+        conn.commit()
+
+        for r in ratings_data:
+            old_wid = r.get('work_id')
+            if old_wid not in id_map:
+                continue
+            new_wid = id_map[old_wid]
+            c = conn.cursor()
+            if conflict == 'merge':
+                c.execute('''SELECT id FROM ratings
+                    WHERE work_id = ? AND score = ? AND rated_at = ?''',
+                    (new_wid, r.get('score'), r.get('rated_at')))
+                if c.fetchone():
+                    continue
+            c.execute('''INSERT INTO ratings (work_id, score, rated_at)
+                VALUES (?, ?, ?)''', (new_wid, r.get('score'), r.get('rated_at')))
+            c.execute('UPDATE works SET rating = COALESCE((SELECT MAX(score) FROM ratings WHERE work_id = ?), rating) WHERE id = ?',
+                (new_wid, new_wid))
+        conn.commit()
+
+        for n in notes_data:
+            old_wid = n.get('work_id')
+            if old_wid not in id_map:
+                continue
+            new_wid = id_map[old_wid]
+            c = conn.cursor()
+            if conflict == 'merge':
+                c.execute('''SELECT id FROM notes
+                    WHERE work_id = ? AND content = ? AND created_at = ?''',
+                    (new_wid, n.get('content'), n.get('created_at')))
+                if c.fetchone():
+                    continue
+            c.execute('''INSERT INTO notes (work_id, content, created_at)
+                VALUES (?, ?, ?)''', (new_wid, n.get('content'), n.get('created_at')))
+        conn.commit()
+
+        if conflict == 'merge':
+            for new_wid in set(id_map.values()):
+                _recalc_work_progress(conn, new_wid)
+        conn.commit()
+    finally:
+        conn.close()
     return results

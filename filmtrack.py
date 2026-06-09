@@ -29,7 +29,8 @@ from database import (
     get_monthly_stats, delete_work, update_work, validate_episode,
     delete_watch_log, update_watch_log, export_full_data,
     import_works_csv, import_works_text, get_ratings, find_duplicate_work,
-    STATUS_OPTIONS, TYPE_OPTIONS, WEEKDAYS, WEEKDAY_CN
+    STATUS_OPTIONS, TYPE_OPTIONS, WEEKDAYS, WEEKDAY_CN,
+    get_organize_report, get_stats, get_yearly_stats, restore_full_data,
 )
 
 STATUS_COLORS = {
@@ -102,6 +103,28 @@ def warn(msg):
 
 def cmd_search(args):
     results = search_works(args.keyword)
+    if args.status:
+        results = [w for w in results if w['status'] == args.status]
+    if args.type:
+        results = [w for w in results if w['type'] == args.type]
+    if args.platform:
+        results = [w for w in results if w['platform'] == args.platform]
+    if args.min_rating is not None:
+        results = [w for w in results if w['rating'] is not None and w['rating'] >= args.min_rating]
+    if args.max_rating is not None:
+        results = [w for w in results if w['rating'] is not None and w['rating'] <= args.max_rating]
+    if args.has_notes is True:
+        results = [w for w in results if w['notes']]
+    elif args.has_notes is False:
+        results = [w for w in results if not w['notes']]
+    if args.stalled_days and args.stalled_days > 0:
+        cutoff = (date.today() - timedelta(days=args.stalled_days)).isoformat()
+        results = [w for w in results if w['status'] in ('watching', 'on-hold')
+            and (not w['last_watched_at'] or w['last_watched_at'][:10] < cutoff)]
+    if args.reminder_only is True:
+        results = [w for w in results if w['reminder_set']]
+    elif args.reminder_only is False:
+        results = [w for w in results if not w['reminder_set']]
     if not results:
         print(f'未找到与 "{args.keyword}" 相关的作品')
         return
@@ -175,11 +198,15 @@ def cmd_status(args):
     work = get_work(args.id)
     if not work:
         error(f'未找到 ID={args.id} 的作品')
+    status_val = args.status_opt or args.status
     if args.episode is not None:
         ep, err = validate_episode(work, args.episode)
         if err:
             error(err)
-    ok, err = update_status(args.id, args.status, args.episode)
+    if not status_val and args.episode is None:
+        print_work_row(work)
+        return
+    ok, err = update_status(args.id, status_val, args.episode)
     if not ok:
         error(err)
     work = get_work(args.id)
@@ -215,9 +242,12 @@ def cmd_note(args):
     print(f'{GREEN}✓{RESET} 已添加笔记到《{work["title"]}》')
 
 def cmd_list(args):
-    works = list_works(status=args.status, work_type=args.type, platform=args.platform)
+    works = list_works(status=args.status, work_type=args.type, platform=args.platform,
+                       min_rating=args.min_rating, max_rating=args.max_rating,
+                       has_notes=args.has_notes, stalled_days=args.stalled_days,
+                       reminder_only=args.reminder_only)
     if not works:
-        print('片库为空')
+        print('没有符合条件的作品')
         return
     header_parts = ['列表']
     if args.status:
@@ -226,6 +256,18 @@ def cmd_list(args):
         header_parts.append(f'类型={color_type(args.type)}')
     if args.platform:
         header_parts.append(f'平台=@{args.platform}')
+    if args.min_rating is not None or args.max_rating is not None:
+        header_parts.append(f'评分 {args.min_rating or 0}-{args.max_rating or 10}')
+    if args.has_notes is True:
+        header_parts.append('有笔记')
+    elif args.has_notes is False:
+        header_parts.append('无笔记')
+    if args.stalled_days:
+        header_parts.append(f'{args.stalled_days}天未看')
+    if args.reminder_only is True:
+        header_parts.append('已开提醒')
+    elif args.reminder_only is False:
+        header_parts.append('未开提醒')
     print(f'{" ".join(header_parts)}（共 {len(works)} 部）：')
     for w in works:
         print_work_row(w)
@@ -323,53 +365,168 @@ def cmd_calendar(args):
             ep_str = f' 更新{ep_cnt}集'
         print(f'    • {w["title"]} [{w["type"]}]{ep_str}')
 
-def cmd_stats(args):
-    year = args.year or datetime.now().year
-    month = args.month or datetime.now().month
-    s = get_monthly_stats(year, month)
-    print(f'{BOLD}📊 {year}年{month}月观影统计{RESET}')
-    print('='*44)
-    print(f'观看作品数：  {s["totals"]["works_watched"]}')
-    print(f'观看集数：    {s["totals"]["episodes_watched"]}')
-    print(f'观影天数：    {s["watch_days"]} 天')
-    print(f'最长连续：    {s["max_streak"]} 天')
+def _render_stats_text(s):
+    lines = []
+    sd, ed = s['start_date'], s['end_date']
+    if sd == ed.replace(day=1) and ed.month == 12 and ed.day == 31:
+        label = f'{sd.year} 年度观影统计'
+    elif sd.day == 1 and (ed + timedelta(days=1)).day == 1 and sd.month == ed.month:
+        label = f'{sd.year}年{sd.month}月观影统计'
+    else:
+        label = f'观影统计（{sd.isoformat()} ~ {ed.isoformat()}）'
+    lines.append(f'{BOLD}📊 {label}{RESET}')
+    lines.append('=' * 44)
+    lines.append(f'观看作品数：  {s["totals"]["works_watched"]}')
+    lines.append(f'观看集数：    {s["totals"]["episodes_watched"]}')
+    lines.append(f'观影天数：    {s["watch_days"]} 天')
+    lines.append(f'最长连续：    {s["max_streak"]} 天')
     if s["avg_rating"]:
-        print(f'平均评分：    {s["avg_rating"]:.1f}/10  {stars(s["avg_rating"])}')
-
+        lines.append(f'平均评分：    {s["avg_rating"]:.1f}/10  {stars(s["avg_rating"])}')
     if s["by_type"]:
         total_eps = sum(t['ep_cnt'] for t in s['by_type']) or 1
-        print()
-        print(f'{BOLD}类型占比（按集数）：{RESET}')
+        lines.append('')
+        lines.append(f'{BOLD}类型占比（按集数）：{RESET}')
         for t in s['by_type']:
             pct = t['ep_cnt'] / total_eps * 100
             bar = '█' * int(pct / 5)
-            print(f'  {color_type(t["type"]):<15} {t["works_cnt"]}部 / {t["ep_cnt"]}集  {bar} {pct:.0f}%')
-
+            lines.append(f'  {color_type(t["type"]):<15} {t["works_cnt"]}部 / {t["ep_cnt"]}集  {bar} {pct:.0f}%')
     if s["by_platform"]:
         total_p = sum(p['cnt'] for p in s['by_platform']) or 1
-        print()
-        print(f'{BOLD}观看平台：{RESET}')
+        lines.append('')
+        lines.append(f'{BOLD}观看平台：{RESET}')
         for p in s['by_platform']:
             pct = p['cnt'] / total_p * 100
             bar = '█' * int(pct / 5)
-            print(f'  @{p["platform"]:<13} {p["cnt"]}集  {bar} {pct:.0f}%')
-
+            lines.append(f'  @{p["platform"]:<13} {p["cnt"]}集  {bar} {pct:.0f}%')
     if s["rating_dist"]:
-        print()
-        print(f'{BOLD}评分分布：{RESET}')
+        lines.append('')
+        lines.append(f'{BOLD}评分分布：{RESET}')
         ordered = [k for k in ['0-2', '2-4', '4-6', '6-8', '8-10'] if k in s["rating_dist"]]
         max_cnt = max(s["rating_dist"].values()) or 1
         for key in ordered:
             cnt = s["rating_dist"][key]
             bar = '█' * int(cnt / max_cnt * 20)
-            print(f'  {key}分  {cnt}部  {bar}')
-
+            lines.append(f'  {key}分  {cnt}部  {bar}')
+    if s["rated_works"]:
+        lines.append('')
+        lines.append(f'{BOLD}最高分作品：{RESET}')
+        seen = set()
+        rank = 0
+        for r in s['rated_works']:
+            if r['work_id'] in seen:
+                continue
+            seen.add(r['work_id'])
+            rank += 1
+            if rank > 10:
+                break
+            lines.append(f'  {rank:>2}. {r["title"]}  {stars(r["score"])} {r["score"]}/10')
     if s["top_works"]:
-        print()
-        print(f'{BOLD}观看最多（Top {len(s["top_works"])}）：{RESET}')
+        lines.append('')
+        lines.append(f'{BOLD}观看最多（Top {len(s["top_works"])}）：{RESET}')
         for i, w in enumerate(s["top_works"], 1):
             ep_unit = '集' if w["type"] in ('series', 'anime') else '次'
-            print(f'  {i:>2}. {w["title"]}  {w["ep_cnt"]}{ep_unit}')
+            lines.append(f'  {i:>2}. {w["title"]}  {w["ep_cnt"]}{ep_unit}')
+    return '\n'.join(lines)
+
+def _render_stats_markdown(s):
+    lines = []
+    sd, ed = s['start_date'], s['end_date']
+    if sd == ed.replace(day=1) and ed.month == 12 and ed.day == 31:
+        label = f'{sd.year} 年度观影统计'
+    elif sd.day == 1 and (ed + timedelta(days=1)).day == 1 and sd.month == ed.month:
+        label = f'{sd.year} 年 {sd.month} 月观影统计'
+    else:
+        label = f'观影统计（{sd.isoformat()} ~ {ed.isoformat()}）'
+    lines.append(f'# {label}')
+    lines.append('')
+    lines.append('## 概览')
+    lines.append('')
+    lines.append(f'- 观看作品数：**{s["totals"]["works_watched"]}**')
+    lines.append(f'- 观看集数：**{s["totals"]["episodes_watched"]}**')
+    lines.append(f'- 观影天数：**{s["watch_days"]}** 天')
+    lines.append(f'- 最长连续观影：**{s["max_streak"]}** 天')
+    if s["avg_rating"]:
+        lines.append(f'- 平均评分：**{s["avg_rating"]:.1f}/10**')
+    if s["by_type"]:
+        lines.append('')
+        lines.append('## 类型占比（按集数）')
+        lines.append('')
+        lines.append('| 类型 | 作品数 | 集数 | 占比 |')
+        lines.append('| ---- | ------ | ---- | ---- |')
+        total_eps = sum(t['ep_cnt'] for t in s['by_type']) or 1
+        for t in s['by_type']:
+            pct = t['ep_cnt'] / total_eps * 100
+            lines.append(f'| {t["type"]} | {t["works_cnt"]} | {t["ep_cnt"]} | {pct:.1f}% |')
+    if s["by_platform"]:
+        lines.append('')
+        lines.append('## 观看平台')
+        lines.append('')
+        lines.append('| 平台 | 集数 | 占比 |')
+        lines.append('| ---- | ---- | ---- |')
+        total_p = sum(p['cnt'] for p in s['by_platform']) or 1
+        for p in s['by_platform']:
+            pct = p['cnt'] / total_p * 100
+            lines.append(f'| @{p["platform"]} | {p["cnt"]} | {pct:.1f}% |')
+    if s["rating_dist"]:
+        lines.append('')
+        lines.append('## 评分分布')
+        lines.append('')
+        lines.append('| 评分区间 | 作品数 |')
+        lines.append('| -------- | ------ |')
+        for key in ['0-2', '2-4', '4-6', '6-8', '8-10']:
+            if key in s["rating_dist"]:
+                lines.append(f'| {key} 分 | {s["rating_dist"][key]} |')
+    if s["rated_works"]:
+        lines.append('')
+        lines.append('## 最高分作品')
+        lines.append('')
+        lines.append('| 排名 | 作品 | 评分 |')
+        lines.append('| ---- | ---- | ---- |')
+        seen = set()
+        rank = 0
+        for r in s['rated_works']:
+            if r['work_id'] in seen:
+                continue
+            seen.add(r['work_id'])
+            rank += 1
+            if rank > 10:
+                break
+            lines.append(f'| {rank} | {r["title"]} | {r["score"]}/10 |')
+    if s["top_works"]:
+        lines.append('')
+        lines.append('## 观看最多')
+        lines.append('')
+        lines.append('| 排名 | 作品 | 观看量 |')
+        lines.append('| ---- | ---- | ------ |')
+        for i, w in enumerate(s["top_works"], 1):
+            ep_unit = '集' if w["type"] in ('series', 'anime') else '次'
+            lines.append(f'| {i} | {w["title"]} | {w["ep_cnt"]} {ep_unit} |')
+    lines.append('')
+    return '\n'.join(lines)
+
+def cmd_stats(args):
+    today = datetime.now().date()
+    if args.from_date or args.to_date:
+        sd = date.fromisoformat(args.from_date) if args.from_date else today.replace(month=1, day=1)
+        ed = date.fromisoformat(args.to_date) if args.to_date else today
+        s = get_stats(sd, ed)
+    elif args.year and not args.month:
+        s = get_yearly_stats(args.year)
+    else:
+        year = args.year or today.year
+        month = args.month or today.month
+        s = get_monthly_stats(year, month)
+    fmt = args.format or 'text'
+    if fmt == 'markdown':
+        text = _render_stats_markdown(s)
+    else:
+        text = _render_stats_text(s)
+    if args.output:
+        with open(args.output, 'w', encoding='utf-8') as f:
+            f.write(text + '\n')
+        print(f'{GREEN}✓{RESET} 统计已导出到 {args.output}')
+    else:
+        print(text)
 
 def cmd_export(args):
     if args.full:
@@ -501,6 +658,78 @@ def cmd_import(args):
         else:
             print(f'  {RED}✗{RESET} {row_str[:40]} → {r["error"]}')
 
+def cmd_cleanup(args):
+    report = get_organize_report()
+    print(f'{BOLD}🧹 片库整理报告{RESET}')
+    print('=' * 44)
+    shown = 0
+    if report['duplicates']:
+        shown += 1
+        print()
+        print(f'{YELLOW}重复标题作品：{RESET}（{sum(len(g) for g in report["duplicates"])} 条）')
+        for group in report['duplicates']:
+            print(f'  ─ "{group[0]["title"]}"')
+            for w in group:
+                ep = f' E{w["current_episode"] or 0}/{w["total_episodes"] or "?"}' if w['type'] in ('series','anime') else ''
+                print(f'    ID={w["id"]}  {color_status(w["status"])}  {w["type"]}{ep}  @{w["platform"] or "-"}')
+    if report['missing_episodes']:
+        shown += 1
+        print()
+        print(f'{YELLOW}剧集未设置总集数：{RESET}（{len(report["missing_episodes"])} 部）')
+        for w in report['missing_episodes']:
+            print(f'  ID={w["id"]}  {w["title"]}  {color_status(w["status"])}  E{w["current_episode"] or 0}/?')
+    if report['finished_not_completed']:
+        shown += 1
+        print()
+        print(f'{YELLOW}已看完但未标记为 completed：{RESET}（{len(report["finished_not_completed"])} 部）')
+        for w in report['finished_not_completed']:
+            ep = f' E{w["current_episode"]}/{w["total_episodes"]}'
+            print(f'  ID={w["id"]}  {w["title"]}  {color_status(w["status"])}{ep}  建议: status {w["id"]} -s completed')
+    if report['aired_but_completed']:
+        shown += 1
+        print()
+        print(f'{DIM}设置了更新日但已全部看完：{RESET}（{len(report["aired_but_completed"])} 部，可移除更新日）')
+        for w in report['aired_but_completed']:
+            print(f'  ID={w["id"]}  {w["title"]}  周{WEEKDAY_CN.get(w["air_weekday"], w["air_weekday"])}  E{w["current_episode"]}/{w["total_episodes"]}  建议: edit {w["id"]} --no-air-weekday')
+    if report['long_stalled']:
+        shown += 1
+        print()
+        print(f'{DIM}追剧超过 60 天未看：{RESET}（{len(report["long_stalled"])} 部）')
+        for w in report['long_stalled']:
+            ep = f' E{w["current_episode"] or 0}/{w["total_episodes"] or "?"}' if w['type'] in ('series','anime') else ''
+            last = w['last_watched_at'][:10] if w['last_watched_at'] else '从未观看'
+            print(f'  ID={w["id"]}  {w["title"]}{ep}  上次: {last}')
+    if shown == 0:
+        print()
+        print(f'{GREEN}片库很整洁，没有发现问题 ✓{RESET}')
+
+def cmd_restore(args):
+    path = args.file
+    if not os.path.exists(path):
+        error(f'文件不存在：{path}')
+    with open(path, 'r', encoding='utf-8') as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError as e:
+            error(f'JSON 解析失败: {e}')
+    if not isinstance(data, dict) or 'works' not in data:
+        error('备份文件格式不正确：缺少 works 字段')
+    conflict = args.conflict or 'skip'
+    if conflict not in ('skip', 'merge', 'create'):
+        error('冲突策略必须是 skip / merge / create 之一')
+    results = restore_full_data(data, conflict=conflict)
+    n_create = sum(1 for r in results if r['action'] == 'create')
+    n_skip = sum(1 for r in results if r['action'] == 'skip')
+    n_merge = sum(1 for r in results if r['action'] == 'merge')
+    print(f'恢复完成：新建 {GREEN}{n_create}{RESET}，合并 {YELLOW}{n_merge}{RESET}，跳过 {DIM}{n_skip}{RESET}')
+    for r in results:
+        if r['action'] == 'create':
+            print(f'  {GREEN}+{RESET} [ID={r["new_id"]}] {r["title"]}')
+        elif r['action'] == 'merge':
+            print(f'  {YELLOW}M{RESET} [ID={r["existing_id"]}] {r["title"]}  {r["reason"]}')
+        else:
+            print(f'  {DIM}·{RESET} [ID={r["existing_id"]}] {r["title"]}  {r["reason"]}')
+
 def cmd_remind(args):
     if args.set is not None or args.days_before is not None:
         if not args.id:
@@ -623,6 +852,8 @@ def cmd_edit(args):
         'remind_days_before': args.remind_before,
     }
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    if args.no_air_weekday:
+        kwargs['air_weekday'] = None
     if not kwargs:
         print('未提供任何修改项')
         return
@@ -664,9 +895,19 @@ def main():
     )
     sub = parser.add_subparsers(dest='command')
 
-    p_search = sub.add_parser('search', help='搜索片库中的作品')
+    p_search = sub.add_parser('search', help='搜索片库中的作品（支持评分、笔记、更新等筛选）')
     p_search.add_argument('keyword', help='搜索关键词')
-    p_search.set_defaults(func=cmd_search)
+    p_search.add_argument('--status', '-s', choices=STATUS_OPTIONS)
+    p_search.add_argument('--type', '-t', choices=TYPE_OPTIONS)
+    p_search.add_argument('--platform', '-p')
+    p_search.add_argument('--min-rating', type=float)
+    p_search.add_argument('--max-rating', type=float)
+    p_search.add_argument('--has-notes', dest='has_notes', action='store_true')
+    p_search.add_argument('--no-notes', dest='has_notes', action='store_false')
+    p_search.add_argument('--stalled-days', type=int)
+    p_search.add_argument('--reminder-only', dest='reminder_only', action='store_true')
+    p_search.add_argument('--no-reminder', dest='reminder_only', action='store_false')
+    p_search.set_defaults(func=cmd_search, has_notes=None, reminder_only=None)
 
     p_add = sub.add_parser('add', help='添加作品到片库（自动检测重复）')
     p_add.add_argument('title', help='作品名称')
@@ -691,9 +932,10 @@ def main():
     p_watch.add_argument('--movie', '-m', action='store_true', help='电影完整观看')
     p_watch.set_defaults(func=cmd_watch)
 
-    p_status = sub.add_parser('status', help='设置作品状态')
+    p_status = sub.add_parser('status', help='设置作品状态与进度')
     p_status.add_argument('id', type=int, help='作品 ID')
-    p_status.add_argument('status', choices=STATUS_OPTIONS, help='状态')
+    p_status.add_argument('status', nargs='?', choices=STATUS_OPTIONS, help='状态（位置参数，也可用 -s）')
+    p_status.add_argument('-s', '--set', dest='status_opt', choices=STATUS_OPTIONS, help='状态')
     p_status.add_argument('--episode', '-e', type=int, help='设置当前集数（严格校验）')
     p_status.set_defaults(func=cmd_status)
 
@@ -722,20 +964,31 @@ def main():
     p_hist.add_argument('--yes', '-y', action='store_true', help='跳过撤销确认')
     p_hist.set_defaults(func=cmd_history)
 
-    p_list = sub.add_parser('list', help='列出片单')
+    p_list = sub.add_parser('list', help='列出片单（支持多种筛选）')
     p_list.add_argument('--status', '-s', choices=STATUS_OPTIONS, help='按状态筛选')
     p_list.add_argument('--type', '-t', choices=TYPE_OPTIONS, help='按类型筛选')
     p_list.add_argument('--platform', '-p', help='按平台筛选')
-    p_list.set_defaults(func=cmd_list)
+    p_list.add_argument('--min-rating', type=float, help='最低评分（含）')
+    p_list.add_argument('--max-rating', type=float, help='最高评分（含）')
+    p_list.add_argument('--has-notes', dest='has_notes', action='store_true', help='只看有笔记的')
+    p_list.add_argument('--no-notes', dest='has_notes', action='store_false', help='只看没有笔记的')
+    p_list.add_argument('--stalled-days', type=int, help='追剧超过 N 天没看的')
+    p_list.add_argument('--reminder-only', dest='reminder_only', action='store_true', help='只看开启提醒的')
+    p_list.add_argument('--no-reminder', dest='reminder_only', action='store_false', help='只看没开启提醒的')
+    p_list.set_defaults(func=cmd_list, has_notes=None, reminder_only=None)
 
-    p_cal = sub.add_parser('calendar', help='查看更新日历（已完结作品不再显示）')
+    p_cal = sub.add_parser('calendar', help='查看更新日历（已完结作品不再显示，多周更新按集数递增显示）')
     p_cal.add_argument('--range', '-r', choices=['today', 'week', 'month'], default='week',
                        help='today/week/month')
     p_cal.set_defaults(func=cmd_calendar)
 
-    p_stats = sub.add_parser('stats', help='月度观影统计')
-    p_stats.add_argument('--year', '-y', type=int, help='年份')
-    p_stats.add_argument('--month', '-m', type=int, help='月份')
+    p_stats = sub.add_parser('stats', help='观影统计：月度/年度/自定义范围，可导出 Markdown')
+    p_stats.add_argument('--year', '-y', type=int, help='年份（仅指定年份时为年度统计）')
+    p_stats.add_argument('--month', '-m', type=int, help='月份（默认当月）')
+    p_stats.add_argument('--from-date', help='起始日期 YYYY-MM-DD（自定义范围）')
+    p_stats.add_argument('--to-date', help='结束日期 YYYY-MM-DD（自定义范围）')
+    p_stats.add_argument('--format', '-f', choices=['text', 'markdown'], help='输出格式')
+    p_stats.add_argument('--output', '-o', help='导出到文件')
     p_stats.set_defaults(func=cmd_stats)
 
     p_export = sub.add_parser('export', help='导出（简单清单或完整备份）')
@@ -743,14 +996,24 @@ def main():
     p_export.add_argument('--status', '-s', choices=STATUS_OPTIONS)
     p_export.add_argument('--type', '-t', choices=TYPE_OPTIONS)
     p_export.add_argument('--platform', '-p')
-    p_export.add_argument('--full', '-f', action='store_true', help='完整导出（含观看日志、评分、笔记）便于迁移')
-    p_export.add_argument('--format', choices=['text', 'json'], default='text', help='完整导出时的格式')
+    p_export.add_argument('--full', action='store_true', help='完整导出（含观看日志、评分、笔记）便于迁移')
+    p_export.add_argument('--format', '-F', choices=['text', 'json'], default='text', help='完整导出时的格式 (text/json)')
     p_export.set_defaults(func=cmd_export)
 
     p_import = sub.add_parser('import', help='从 CSV 或简单文本批量导入作品（自动检测重复）')
     p_import.add_argument('file', help='输入文件路径')
     p_import.add_argument('--format', '-f', choices=['csv', 'text'], help='文件格式（默认按扩展名推断）')
     p_import.set_defaults(func=cmd_import)
+
+    p_restore = sub.add_parser('restore', help='从 export --full 导出的 JSON 完整恢复到片库')
+    p_restore.add_argument('file', help='JSON 备份文件路径')
+    p_restore.add_argument('--conflict', '-c', choices=['skip', 'merge', 'create'], default='skip',
+        help='同名作品冲突策略：skip 跳过/merge 合并历史与评分/create 强制新建')
+    p_restore.set_defaults(func=cmd_restore)
+
+    p_cleanup = sub.add_parser('cleanup', aliases=['organize'],
+        help='片库整理：列出重复、缺集数、完结状态不一致、已看完仍在更新日历中的作品')
+    p_cleanup.set_defaults(func=cmd_cleanup)
 
     p_remind = sub.add_parser('remind', help='查看和设置提醒')
     p_remind.add_argument('--id', type=int, help='作品 ID')
@@ -773,6 +1036,7 @@ def main():
     p_edit.add_argument('--next-air')
     p_edit.add_argument('--genre', '-g')
     p_edit.add_argument('--air-weekday', choices=WEEKDAYS)
+    p_edit.add_argument('--no-air-weekday', action='store_true', help='清除更新日设置')
     p_edit.add_argument('--episodes-per-air', type=int)
     p_edit.add_argument('--remind-before', type=int)
     p_edit.set_defaults(func=cmd_edit)
